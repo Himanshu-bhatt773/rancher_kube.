@@ -1,0 +1,171 @@
+1 Install the nodes with ubuntu 18.04
+2. Set Ip address and stuff.
+3. Add hostname entries in the hosts files. (All nodes)
+#####################
+192.168.50.229	qkube1
+192.168.50.36	qkube2
+192.168.50.37	qkube3
+#########################
+
+apt update -y && apt upgrade -y && apt dist-upgrade -y
+
+Upgrade packages and stuff and install Docker. (All nodes)
+
+apt -y install apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt -y install docker-ce
+########Enable a user to run docker without doing sudo, we did ubuntu as we used ubuntu user.##########3
+usermod -a -G docker ubuntu
+
+################We also need to install kubectl and kubeadm before doing rancher installation   (All nodes)
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add
+apt-add-repository "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+apt install kubeadm -y
+###########################################
+
+Install NTP for cluter time sync.  (All nodes)
+apt -y install chrony
+
+#########Enable at startup####################
+systemctl enable docker chrony
+
+############# generate ssh key  and copy all ubunut user all node#######
+ssh-keygen
+
+Don't use hostname in the cluster file, can be risky use floating IP address.  
+Create rancher-cluster.yml as mentioned with following contents.
+Note -- The last node in the yml file will have the API installed. So all the worker nodes on top and master at the end.
+
+############
+nodes:
+  - address: 192.168.50.219
+    internal_address: 10.10.30.175
+    user: ubuntu
+    role: [controlplane, worker, etcd]
+    ssh_key_path: /home/xeryacld/adkey1.pem
+  - address: 192.168.50.26
+    internal_address: 10.10.30.128
+    user: ubuntu
+    role: [controlplane, worker, etcd]
+    ssh_key_path: /home/xeryacld/adkey1.pem
+  - address: 192.168.50.27
+    internal_address: 10.10.30.224
+    user: ubuntu
+    role: [controlplane, worker, etcd]
+    ssh_key_path: /home/xeryacld/adkey1.pem
+
+services:
+  etcd:
+    snapshot: true
+    creation: 6h
+    retention: 24h
+###Added cluster name to reflect######
+  kubelet:
+    cluster_domain: cluster.dev1
+# Required for external TLS termination with
+# ingress-nginx v0.22+
+ingress:
+  provider: nginx
+  options:
+    use-forwarded-headers: "true"
+
+############dowload rke for linux and copy to rke dir.#####3
+wget https://github.com/rancher/rke/releases/download/v1.3.9/rke_linux-amd64
+mv rke_linux-amd64 rke
+chmod +x rke
+
+
+##########Deploy the cluster now.############   
+./rke up --config ./rancher-cluster.yml
+
+####Copy to home config###### This removes the need to copy over the config file everytime we login.##
+mkdir /root/.kube
+sudo cp kube_config_rancher-cluster.yml /root/.kube/config
+
+########Kubernetes installed but we need to install helm and rancher for helm use 3.0 or latest stable##################3
+curl https://helm.baltorepo.com/organization/signing.asc | sudo apt-key add -
+sudo apt-get install apt-transport-https --yes
+echo "deb https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+sudo apt -y update
+sudo apt -y install helm
+
+############Below is the old procedure to install helm. Above is the new one##########################
+sudo wget https://get.helm.sh/helm-v3.0.0-linux-amd64.tar.gz
+sudo tar -zxvf helm-v3.0.0-linux-amd64.tar.gz
+sudo mv linux-amd64/helm /usr/local/bin/helm
+
+#########Now we get to rancher ############
+helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+kubectl create namespace cattle-system
+
+########Note for self signed certificates you can use --set privateCA=true , but with this option also you need to create a separate proper self signed tls certificate.
+######## Use this link if doing private CA https://rancher.com/docs/rancher/v2.x/en/installation/options/tls-secrets/. Best is to deploy cert-manager.
+helm install rancher rancher-stable/rancher \
+  --namespace cattle-system \
+  --set hostname=qkube1.com \
+  --set ingress.tls.source=secret
+
+##############33Check if the deployment is completed now###############
+kubectl -n cattle-system rollout status deploy/rancher
+kubectl -n cattle-system get deploy rancher
+
+end:-------
+
+
+########We need to give a file based secret for the ingress to work for rancher UI ##################
+kubectl -n cattle-system get ing
+kubectl -n cattle-system get ing rancher -o yaml
+
+
+##################Check Cattle System######################################
+kubectl -n cattle-system get pods
+
+
+######Now create a certificate named tls-rancher-ingress so that ingress can pass traffic to the host#########################
+Xeryadev1@2020
+Xeryaqas1@2020
+
+For certificate creation self signed refer to the secret.yml in this directory.
+Probably we need to create cert-manager deployment and then go for lets encrypt certificate management.
+
+
+#############Now if you check the cattle-system namespace you would notice some containers will not start. This is becoz they can not get to rancherui.dev.xerya.com as it is an external IP. So again use host aliases to put name to IP resolution. I used 192.168.50.26 -- rancherui.dev.xerya.com
+
+hostAliases:
+  - ip: "192.168.50.26"
+    hostnames:
+    - "rancherui.dev.xerya.com"
+
+Post this the setup might also complain about the certificate being not valid -- deploy cert-manager and get a valid certificate to fix this.
+
+#################Deploy Cert Manager ############################
+To deploy cert-manager a manual config yaml was used from here -- https://cert-manager.io/docs/installation/kubernetes/
+One yaml and creds and cert-manager were installed.
+
+wget https://github.com/jetstack/cert-manager/releases/download/v0.14.1/cert-manager.yaml
+
+kubectl apply -f cert-manager.yaml
+
+
+Now after you have registered domains on ACME, enabled the acme and it is running nicely. and cert-manager is up. Go forward and create a Cluster-Issuer.
+Use this below command to find the resource is being suplied by which API.
+kubectl api-resources | grep ClusterIssuer
+
+Once you have the cluster issuer, you need to create certificate for the environment. Befire validating anything, please bear in mind that the secret referred to as certmanager-secret needs to be created manually. (acmedns.json)
+
+kubectl -n cert-manager create secret generic certmanager-secret-staging --from-file=acmedns.json=acmedns.json
+
+Also not for a wildcard or for a normal subdomain like nexus.dev.xerya.com. For each subdomain a separate entry is required in acmedns.json. SO have that and then go for certificate validation. Also not these resources...
+
+kubectl -n devops get certificate ----------kubectl -n devops get challenges
+kubectl -n devops describe challenge <challenge_name>
+
+in our new environment case the secret name was certmanager-secret-staging and certmanager-secret-prod (once moved to prod)
+
+This is how we created the secret -- kubectl -n cert-manager create secret generic certmanager-secret-staging --from-file=acmedns.json=acmedns.json and it worked. Follow below for production.
+
+kubectl -n cert-manager create secret generic certmanager-secret-prod --from-file=acmedns.json=acmedns.json
+
+Also you can have both types of issuers in place. staging as well as prod side-by-side. Make reference to see the dev environment deployed.
+
